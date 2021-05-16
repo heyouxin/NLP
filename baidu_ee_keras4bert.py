@@ -250,7 +250,7 @@ class Evaluator(keras.callbacks.Callback):
         self.best_val_f1 = 0.
 
     def on_epoch_end(self, epoch, logs=None):
-        f1, precision, recall = evaluate(valid_data)
+        f1, precision, recall = evaluate(valid_data[0:100])
         if f1 >= self.best_val_f1:
             self.best_val_f1 = f1
             model.save_weights('best_model.weights')
