@@ -16,15 +16,16 @@
 -------------------------------------------------
 
 """
-
+import tensorflow_addons as tfa
 import tensorflow as tf
+from tensorflow.keras import Model
 import json
 import pylcs
 from tqdm import tqdm
 import numpy as np
 from transformers import BertTokenizerFast, AutoTokenizer, BertTokenizer, TFBertForSequenceClassification, \
 	TFBertForTokenClassification, TFAlbertModel
-
+from tensorflow.keras.layers import Dense
 tf.get_logger().setLevel('ERROR')
 
 def load_data(filename):
@@ -137,14 +138,14 @@ def general_y_label(train_data,tokenizer):
 def extract_arguments(text):
 	"""arguments抽取函数
 	"""
-
+	#text = x[10605]
 	x_tok = tokenizer([text],is_split_into_words = True,return_offsets_mapping=True,return_tensors='tf')
 	mapping = x_tok.offset_mapping[0].numpy()
 	x_tok.pop('offset_mapping')
 
 	output = model(x_tok)
-	labels =np.argmax(output['logits'],axis=-1)[0]
-
+	#labels =np.argmax(output['logits'],axis=-1)[0]
+	labels = np.argmax(output, axis=-1)[0]
 	arguments, starting = [], False
 	for i, label in enumerate(labels):
 		if label > 0:
@@ -159,9 +160,13 @@ def extract_arguments(text):
 			starting = False
 
 	return {
-		text[mapping[w[0]][0]:mapping[w[-1]][-1] + 1]: l
+		text[mapping[w[0]][0]:mapping[w[-1]][-1]]: l
 		for w, l in arguments
 	}
+
+
+
+
 
 
 
@@ -184,228 +189,212 @@ if __name__ == '__main__':
 		num_labels = len(id2label) * 2 + 1
 
 
-	model_dir = '../pretrain_model/bert-base-chinese'
+	model_dir = '../pretrain_model/chinese-bert-wwm-ext'
 	tokenizer = BertTokenizerFast.from_pretrained(model_dir,model_max_length =128,max_length = 128,padding_side = 'right',padding='max_length',truncation='True')
 
 	x,y = general_y_label(train_data,tokenizer)
 	train_x = tokenizer(x, padding=True, truncation=True, return_tensors='tf')
 	train_y = tf.keras.preprocessing.sequence.pad_sequences(y,maxlen=128,padding='post',truncating='post')
-	train_ds = tf.data.Dataset.from_tensor_slices(((dict(train_x), train_y))).shuffle(100).batch(8)
+	#train_y = tf.keras.preprocessing.sequence.pad_sequences(train_y, maxlen=128, padding='post',
+	#                                                        truncating='post')
 
-	#model
+	train_ds = tf.data.Dataset.from_tensor_slices(((dict(train_x), train_y))).shuffle(100).batch(12)
+
+	'''
+	class MyModel(Model):
+		def __init__(self):
+			super(MyModel, self).__init__()
+			self.d1 = TFBertForTokenClassification.from_pretrained(model_dir, num_labels=num_labels)
+			#self.d2 = Dense(num_labels, activation='softmax')
+			#self.d2 = Dense(num_labels, activation='softmax')
+			self.transition_params = tf.Variable(tf.random.uniform(shape=(num_labels, num_labels)))
+
+		def call(self, x,labels=None):
+			text_lens = tf.math.reduce_sum(tf.cast(tf.math.not_equal(x['attention_mask'], 0), dtype=tf.int32), axis=-1)
+			#text_lens = tf.math.reduce_sum(tf.cast(tf.math.not_equal(x, 0), dtype=tf.int32), axis=-1)
+			#text_lens = tf.constant([128 for _ in range(labels.shape[0])])
+			x1 = self.d1(x)
+			#logits = self.d2(x1.logits)
+			logits = x1.logits
+			if labels is not None:
+				label_sequences = tf.convert_to_tensor(labels, dtype=tf.int32)
+				log_likelihood, self.transition_params = tfa.text.crf_log_likelihood(logits,
+				                                                                       label_sequences,
+				                                                                       text_lens,
+				                                                                  transition_params=self.transition_params)
+				return logits,log_likelihood,text_lens
+			else:
+				return logits,text_lens
+
+	model = MyModel()
+	optimizer = tf.keras.optimizers.Adam(5e-5)
+	#train_loss = tf.keras.metrics.Mean(name='train_loss')
+
+
+	@tf.function
+	def train_step(train_x, train_y):
+		with tf.GradientTape() as tape:
+
+			logits, log_likelihood,text_lens = model(train_x,train_y)
+			loss = tf.reduce_mean(-log_likelihood)
+
+		# freeze_conv_var_list = [t for t in model.trainable_variables if
+		#                         not t.name.startswith('tf_bert_for_token_classification')]
+		# gradients = tape.gradient(loss, freeze_conv_var_list)
+		# optimizer.apply_gradients(zip(gradients, freeze_conv_var_list))
+
+		gradients = tape.gradient(loss, model.trainable_variables)
+		optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+		#train_loss(loss)
+		#train_accuracy(train_y, predictions)
+		return loss,logits,text_lens
+
+	def get_acc_one_step(logits,labels_batch,text_lens):
+		paths = []
+		accuracy = 0
+		for logit,  labels,text_len in zip(logits, labels_batch,text_lens):
+			viterbi_path, _ = tfa.text.viterbi_decode(logit[:text_len], model.transition_params)
+			paths.append(viterbi_path)
+			correct_prediction = tf.equal(
+				tf.convert_to_tensor(tf.keras.preprocessing.sequence.pad_sequences([viterbi_path], padding='post'),
+				                     dtype=tf.int32),
+				tf.convert_to_tensor(tf.keras.preprocessing.sequence.pad_sequences([labels[:text_len]], padding='post'),
+				                     dtype=tf.int32)
+			)
+			accuracy = accuracy + tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
+		# print(tf.reduce_mean(tf.cast(correct_prediction, tf.float32)))
+		accuracy = accuracy / len(paths)
+		return accuracy
+
+
+	EPOCHS = 1
+	for epoch in range(EPOCHS):
+		# 在下一个epoch开始时，重置评估指标
+		#train_loss.reset_states()
+
+		step = 0
+		for x_batch, y_batch in tqdm(train_ds):
+			loss,logits,text_lens = train_step(x_batch, y_batch)
+			accuracy = get_acc_one_step(logits, y_batch,text_lens)
+			if step%100 == 0:
+				template = 'step {}, Loss: {}, Acc:{}'
+				print(template.format(step,loss,accuracy))
+		                      #train_loss.result()))
+			step += 1
+		template = 'Epoch {}, Loss: {}, Acc:{}'
+		print(template.format(epoch + 1, loss, accuracy))
+
+
+
+	#inference
+
+	# x_1 = {}
+	# x_1['input_ids'] = train_x['input_ids'][0:1]
+	# x_1['token_type_ids'] = train_x['token_type_ids'][0:1]
+	# x_1['attention_mask'] = train_x['attention_mask'][0:1]
+
+	x_pred = tokenizer([x[1]], padding=True, truncation=True, return_tensors='tf')
+	#x_pred['input_ids'] = x_pred['input_ids'][0] + tf.constant([0 for _ in range(104)])
+	logits,text_lens = model(x_pred)
+	tf.argmax(logits,axis=-1)
+	paths = []
+	for logit,text_len in zip(logits,text_lens):
+		viterbi_path, _ = tfa.text.viterbi_decode(logit[:text_len], model.transition_params)
+		paths.append(viterbi_path)
+	print(paths[0])
+
+	model.save_weights('./checkpoints/ee_transformers')
+	model.load_weights('./checkpoints/ee_transformers')
+	'''
+
+
+	class MyModel(Model):
+		def __init__(self):
+			super(MyModel, self).__init__()
+			self.d1 = TFBertForTokenClassification.from_pretrained(model_dir, num_labels=num_labels)
+	
+
+		def call(self, x):
+			x1 = self.d1(x)
+			return x1.logits
+
+	model = MyModel()
+	model.load_weights('./checkpoints/ee_transformers_without_crf')
+
+
+	loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+	optimizer = tf.keras.optimizers.Adam(5e-10)
+	train_loss = tf.keras.metrics.Mean(name='train_loss')
+	train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+
+
+
+	@tf.function
+	def train_step(batch_x,batch_y):
+		with tf.GradientTape() as tape:
+			predictions = model(batch_x)
+			loss = loss_object(batch_y, predictions)
+
+		gradients = tape.gradient(loss, model.trainable_variables)
+		optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+		train_loss.update_state(loss)
+		train_accuracy.update_state(batch_y, predictions)
+
+	EPOCHS = 2
+	for epoch in range(EPOCHS):
+
+
+		step = 0
+		for batch_x, batch_y in tqdm(train_ds):
+			train_step(batch_x,batch_y)
+			step += 1
+			if step%100 == 0:
+				template = 'step: {}, Loss: {}, Acc:{}'
+				print(template.format(step,train_loss.result(),train_accuracy.result()*100))
+
+		# 在下一个epoch开始时，重置评估指标
+		train_loss.reset_states()
+		train_accuracy.reset_states()
+		# template = 'Epoch {}, Loss: {}, Accuracy: {}'
+		# print (template.format(epoch+1,
+		#                      train_loss.result(),train_accuracy.result()*100))
+
+
+
+
+	f1, precision, recall = evaluate(valid_data)
+	print(
+		'f1: %.5f, precision: %.5f, recall: %.5f' %
+		(f1, precision, recall)
+	)
+	model.save_weights('./checkpoints/ee_transformers_without_crf')
+	extract_arguments(x[10000])
+
+
+
+	'''
 	model = TFBertForTokenClassification.from_pretrained(model_dir,num_labels=num_labels)
-	optimizer = tf.keras.optimizers.Adam()
+	optimizer = tf.keras.optimizers.Adam(5e-5)
 	loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
 	metrics = tf.keras.metrics.SparseCategoricalAccuracy('sparse_accuracy')
 	model.compile(optimizer=optimizer, loss=loss, metrics=[metrics])
 	model.summary()
 
 	evaluator = Evaluator()
-	history = model.fit(train_ds,epochs=1,callbacks=[evaluator])
-	#model.save_pretrained('./ee_trans/')
+	history = model.fit(train_ds,epochs=1)
+	                    #,callbacks=[evaluator])
+	model.save_weights('./checkpoints/ee_transformers_without_crf')
+	
+	
 
 	# ----inference----
-	x_pred = tokenizer(x[0],padding='True',truncation='True',return_tensors='tf')
+	x_pred = tokenizer(x[10605],return_tensors='tf')
 	output = model(x_pred)
-	y_label = np.argmax(output['logits'],axis=-1)
-	extract_arguments(x[0])
+	y_label = np.argmax(output,axis=-1)
+	extract_arguments(x[3])
+	
+	'''
 
 
 
-
-
-'''
-train_x_1,train_y_1 = general_y_label(train_data[0:3000],tokenizer)
-tmp_d = {'x':train_x_1,'y':train_y_1}
-import pandas as pd
-tmp_df = pd.DataFrame(tmp_d)
-tmp_df.to_csv('tmp_df_1.csv',index=False)
-
-
-#--数据
-import pandas as pd
-
-tmp_df_1 = pd.read_csv('tmp_df_1.csv')
-tmp_df_2 = pd.read_csv('tmp_df_2.csv')
-tmp_df_3 = pd.read_csv('tmp_df_3.csv')
-tmp_df_4 = pd.read_csv('tmp_df_4.csv')
-tmp_df = pd.concat([tmp_df_1, tmp_df_2, tmp_df_3, tmp_df_4])
-
-y = tmp_df['y']
-train_x = list(tmp_df['x'])
-train_y = []
-for k in y:
-	train_y.append(eval(k))
-train_y = tf.keras.preprocessing.sequence.pad_sequences(train_y, maxlen=128, padding='post',
-										truncating='post')
-'''
-
-from tensorflow import keras
-import tensorflow.keras as K
-from tensorflow.keras.layers import Layer
-
-class ConditionalRandomField(Layer):
-    """纯Keras实现CRF层
-    CRF层本质上是一个带训练参数的loss计算层。
-    """
-    def __init__(self, lr_multiplier=1, **kwargs):
-        super(ConditionalRandomField, self).__init__(**kwargs)
-        self.lr_multiplier = lr_multiplier  # 当前层学习率的放大倍数
-
-    @integerize_shape
-    def build(self, input_shape):
-        super(ConditionalRandomField, self).build(input_shape)
-        output_dim = input_shape[-1]
-        self._trans = self.add_weight(
-            name='trans',
-            shape=(output_dim, output_dim),
-            initializer='glorot_uniform',
-            trainable=True
-        )
-        if self.lr_multiplier != 1:
-            K.set_value(self._trans, K.eval(self._trans) / self.lr_multiplier)
-
-    @property
-    def trans(self):
-        if self.lr_multiplier != 1:
-            return self.lr_multiplier * self._trans
-        else:
-            return self._trans
-
-    def compute_mask(self, inputs, mask=None):
-        return None
-
-    def call(self, inputs, mask=None):
-        return sequence_masking(inputs, mask, '-inf', 1)
-
-    def target_score(self, y_true, y_pred):
-        """计算目标路径的相对概率（还没有归一化）
-        要点：逐标签得分，加上转移概率得分。
-        """
-        point_score = tf.einsum('bni,bni->b', y_true, y_pred)  # 逐标签得分
-        trans_score = tf.einsum(
-            'bni,ij,bnj->b', y_true[:, :-1], self.trans, y_true[:, 1:]
-        )  # 标签转移得分
-        return point_score + trans_score
-
-    def log_norm_step(self, inputs, states):
-        """递归计算归一化因子
-        要点：1、递归计算；2、用logsumexp避免溢出。
-        """
-        inputs, mask = inputs[:, :-1], inputs[:, -1:]
-        states = K.expand_dims(states[0], 2)  # (batch_size, output_dim, 1)
-        trans = K.expand_dims(self.trans, 0)  # (1, output_dim, output_dim)
-        outputs = tf.reduce_logsumexp(
-            states + trans, 1
-        )  # (batch_size, output_dim)
-        outputs = outputs + inputs
-        outputs = mask * outputs + (1 - mask) * states[:, :, 0]
-        return outputs, [outputs]
-
-    def dense_loss(self, y_true, y_pred):
-        """y_true需要是one hot形式
-        """
-        # 导出mask并转换数据类型
-        mask = K.all(K.greater(y_pred, -1e6), axis=2, keepdims=True)
-        mask = K.cast(mask, K.floatx())
-        # 计算目标分数
-        y_true, y_pred = y_true * mask, y_pred * mask
-        target_score = self.target_score(y_true, y_pred)
-        # 递归计算log Z
-        init_states = [y_pred[:, 0]]
-        y_pred = K.concatenate([y_pred, mask], axis=2)
-        input_length = K.int_shape(y_pred[:, 1:])[1]
-        log_norm, _, _ = K.rnn(
-            self.log_norm_step,
-            y_pred[:, 1:],
-            init_states,
-            input_length=input_length
-        )  # 最后一步的log Z向量
-        log_norm = tf.reduce_logsumexp(log_norm, 1)  # logsumexp得标量
-        # 计算损失 -log p
-        return log_norm - target_score
-
-    def sparse_loss(self, y_true, y_pred):
-        """y_true需要是整数形式（非one hot）
-        """
-        # y_true需要重新明确一下shape和dtype
-        y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
-        y_true = K.cast(y_true, 'int32')
-        # 转为one hot
-        y_true = K.one_hot(y_true, K.shape(self.trans)[0])
-        return self.dense_loss(y_true, y_pred)
-
-    def dense_accuracy(self, y_true, y_pred):
-        """训练过程中显示逐帧准确率的函数，排除了mask的影响
-        此处y_true需要是one hot形式
-        """
-        y_true = K.argmax(y_true, 2)
-        return self.sparse_accuracy(y_true, y_pred)
-
-    def sparse_accuracy(self, y_true, y_pred):
-        """训练过程中显示逐帧准确率的函数，排除了mask的影响
-        此处y_true需要是整数形式（非one hot）
-        """
-        # 导出mask并转换数据类型
-        mask = K.all(K.greater(y_pred, -1e6), axis=2)
-        mask = K.cast(mask, K.floatx())
-        # y_true需要重新明确一下shape和dtype
-        y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
-        y_true = K.cast(y_true, 'int32')
-        # 逐标签取最大来粗略评测训练效果
-        y_pred = K.cast(K.argmax(y_pred, 2), 'int32')
-        isequal = K.cast(K.equal(y_true, y_pred), K.floatx())
-        return K.sum(isequal * mask) / K.sum(mask)
-
-    def get_config(self):
-        config = {
-            'lr_multiplier': self.lr_multiplier,
-        }
-        base_config = super(ConditionalRandomField, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
-
-
-
-def sequence_masking(x, mask, value=0.0, axis=None):
-    """为序列条件mask的函数
-    mask: 形如(batch_size, seq_len)的0-1矩阵；
-    value: mask部分要被替换成的值，可以是'-inf'或'inf'；
-    axis: 序列所在轴，默认为1；
-    """
-    if mask is None:
-        return x
-    else:
-        if K.dtype(mask) != K.dtype(x):
-            mask = K.cast(mask, K.dtype(x))
-        if value == '-inf':
-            value = -1e12
-        elif value == 'inf':
-            value = 1e12
-        if axis is None:
-            axis = 1
-        elif axis < 0:
-            axis = K.ndim(x) + axis
-        assert axis > 0, 'axis must be greater than 0'
-        for _ in range(axis - 1):
-            mask = K.expand_dims(mask, 1)
-        for _ in range(K.ndim(x) - K.ndim(mask)):
-            mask = K.expand_dims(mask, K.ndim(mask))
-        return x * mask + value * (1 - mask)
-
-
-def integerize_shape(func):
-    """装饰器，保证input_shape一定是int或None
-    """
-    def convert(item):
-        if hasattr(item, '__iter__'):
-            return [convert(i) for i in item]
-        elif hasattr(item, 'value'):
-            return item.value
-        else:
-            return item
-
-    def new_func(self, input_shape):
-        input_shape = convert(input_shape)
-        return func(self, input_shape)
-
-    return new_func
