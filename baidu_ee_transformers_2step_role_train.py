@@ -80,7 +80,7 @@ def evaluate(data):
 		#text, arguments,t,t_i = valid_data_a[0]
 		inv_arguments = {(v[0],v[1]): k for k, v in arguments.items()}
 
-		pred_arguments = extract_arguments(text,t_i)
+		pred_arguments = extract_arguments(text,t,t_i)
 
 		pred_inv_arguments = {(v[0],v[1]): k for k, v in pred_arguments.items()}
 		Y += len(pred_inv_arguments)
@@ -111,7 +111,7 @@ def general_y_label(train_data):
 	x = []
 	trigger_idx = []
 	for d in tqdm(train_data):
-		#d = train_data_a[129]
+		#d = train_data_a[0]
 		text = d[0]
 		text_tok = tokenizer([text],return_tensors='pt',is_split_into_words=True,return_offsets_mapping=True)
 		off_map = text_tok['offset_mapping'][0]
@@ -129,28 +129,41 @@ def general_y_label(train_data):
 					for i in range(1, len(a_token_ids)):
 						labels[start_index + i] = label2id_a[(argument[1][0],argument[1][1])] * 2 + 2
 		t_token_ids = tokenizer.encode(d[2])[1:-1]
-		#idx = []
-		start_index = 0
+		idx = []
+		#start_index = 0
 		for i, o_m in enumerate(off_map):
 			if o_m[0] == d[3] and o_m[1] != 0 and i<128:
-				start_index = i
-		trigger_idx.append([start_index])
-				#idx.append(start_index)
-				#for i in range(1, len(t_token_ids)):
-					#idx.append(start_index + i)
-		#trigger_idx.append(idx)
+				#start_index = i
+				idx.append(i)
+				if i+len(t_token_ids)-1 < 128:
+					idx.append(i+len(t_token_ids)-1)
+				else:
+					idx.append(127)
+
+
+				# for j in range(1, len(t_token_ids)):
+				# 	idx.append(i + j)
+		if not idx:
+			idx.append(0)
+			idx.append(0)
+		trigger_idx.append(idx)
 		x.append(text)
 		y.append(labels)
 	return x,y,trigger_idx
+'''7, 11, 25, 53,74,97,101,114,127
+i = 130
+train_data_a[i]
+extract_arguments(x_a[i],train_data_a[i][2],train_data_a[i][3])
 
-
-
-def extract_arguments(text,t_i):
+'''
+def extract_arguments(text,t,t_i):
 	"""arguments抽取函数
 	"""
-	#text = x_a[130]
-	#t_i = torch.tensor([trigger_idx[130]]).to(device)
-	#y_a[129]
+	#text = x_a[0]
+	#t= train_data_a[0][2]
+	#t_i = train_data_a[0][3]
+	#t_i = torch.tensor([trigger_idx[0]]).to(device)
+	#y_a[130]
 	#text = '前两天，被称为 “ 仅次于苹果的软件服务商 ” 的Oracle（ 甲骨文 ）公司突然宣布在中国裁员。。'
 	#t_i = 48
 	#x_tok = tokenizer([text], max_length=128, padding='max_length',is_split_into_words = True,return_offsets_mapping=True,return_tensors='pt')
@@ -159,19 +172,40 @@ def extract_arguments(text,t_i):
 	mapping = x_tok.offset_mapping[0].numpy()
 	x_tok.pop('offset_mapping')
 	x_tok.to(device)
-	start_index = 0
+	# start_index = 0
+	# for i, o_m in enumerate(mapping):
+	# 	if o_m[0] == t_i and o_m[1] != 0 and i < 128:
+	# 		start_index = i
+	t_token_ids = tokenizer.encode(t)[1:-1]
+	idx = []
+	# start_index = 0
 	for i, o_m in enumerate(mapping):
 		if o_m[0] == t_i and o_m[1] != 0 and i < 128:
-			start_index = i
+			# start_index = i
+			idx.append(i)
+			if i + len(t_token_ids) - 1 < 128:
+				idx.append(i + len(t_token_ids) - 1)
+			else:
+				idx.append(127)
 
+	# for j in range(1, len(t_token_ids)):
+	# 	idx.append(i + j)
+	if not idx:
+		idx.append(0)
+		idx.append(0)
 	input_ids = x_tok['input_ids'].to(device)
 	attention_mask = x_tok['attention_mask'].to(device)
 	token_type_ids = x_tok['token_type_ids'].to(device)
-	t_i = torch.tensor([[start_index]]).to(device)
-
+	#t_i = torch.tensor([[start_index]]).to(device)
+	t_i = torch.tensor([idx]).to(device)
 	model_a.eval()
+	# without crf
 	output = model_a(input_ids,attention_mask,token_type_ids,t_i)
 	labels = torch.argmax(output,axis=-1)[0].cpu().numpy()
+	# #crf decode
+	#output,loss = model_a(input_ids, attention_mask, token_type_ids, t_i)
+	#labels = output[0]
+
 	#labels = np.argmax(output, axis=-1)[0]
 	arguments, starting = [], False
 	for i, label in enumerate(labels):
@@ -255,11 +289,11 @@ if __name__ == '__main__':
 			self.weight = nn.Parameter(torch.Tensor(normalized_shape))
 			self.bias = nn.Parameter(torch.Tensor(normalized_shape))
 			#
-			# self.weight_dense = nn.Linear(normalized_shape * 2, normalized_shape, bias=False)
-			# self.bias_dense = nn.Linear(normalized_shape * 2, normalized_shape, bias=False)
+			self.weight_dense = nn.Linear(normalized_shape * 2, normalized_shape, bias=False)
+			self.bias_dense = nn.Linear(normalized_shape * 2, normalized_shape, bias=False)
 
-			self.weight_dense = nn.Linear(normalized_shape , normalized_shape, bias=False)
-			self.bias_dense = nn.Linear(normalized_shape , normalized_shape, bias=False)
+			# self.weight_dense = nn.Linear(normalized_shape , normalized_shape, bias=False)
+			# self.bias_dense = nn.Linear(normalized_shape , normalized_shape, bias=False)
 
 			self.reset_weight_and_bias()
 
@@ -305,7 +339,7 @@ if __name__ == '__main__':
 			self.dropout = torch.nn.Dropout(dropout_prob)
 			self.classifier = torch.nn.Linear(out_dims, self.num_labels)
 			self.conditional_layer_norm = ConditionalLayerNorm(768, eps=self.bert_config.layer_norm_eps)
-			self.crf_module = CRF(num_tags=num_labels, batch_first=True)
+			#self.crf_module = CRF(num_tags=num_labels, batch_first=True)
 		# self._init_weights(init_blocks, initializer_range=self.bert_config.initializer_range)
 
 		def forward(self,
@@ -334,7 +368,7 @@ if __name__ == '__main__':
 			logits = self.classifier(seq_out)
 
 			loss = None
-			'''
+
 			if labels is not None:
 				loss_fct = torch.nn.CrossEntropyLoss()
 				# Only keep active parts of the loss
@@ -362,7 +396,7 @@ if __name__ == '__main__':
 			else:
 				tokens_out = self.crf_module.decode(emissions=logits, mask=attention_mask.byte())
 				return tokens_out,loss
-
+			'''
 
 		def _batch_gather(self,data: torch.Tensor, index: torch.Tensor):
 			"""
@@ -382,7 +416,7 @@ if __name__ == '__main__':
 
 	best_val_f1 = 0
 	model_a.train()
-	optim = torch.optim.Adam(model_a.parameters(), lr=5e-6)
+	optim = torch.optim.Adam(model_a.parameters(), lr=5e-10)
 	for epoch in range(1):
 		for _, batch in tqdm(enumerate(train_loader_a)):
 
@@ -396,7 +430,7 @@ if __name__ == '__main__':
 			b_o = b_m(input_ids=input_ids,attention_mask=attention_mask,token_type_ids=token_type_ids)
 
 			seq_out, pooled_out = b_o[0], b_o[1]
-
+			tri_idx = torch.tensor([[ 6,7,8],[12],[12],[20],[48],[25],[16]]
 			trigger_label_feature = _batch_gather(seq_out, tri_idx)
 
 			trigger_label_feature = trigger_label_feature.view([trigger_label_feature.size()[0], -1])
@@ -430,11 +464,11 @@ if __name__ == '__main__':
 		)
 
 
-	torch.save(model_a.state_dict(), 'pt_checkpoint/model_a_weights.pth')
+	torch.save(model_a.state_dict(), 'pt_checkpoint/model_a_2_weights.pth')
 
 	model_a.load_state_dict(torch.load('pt_checkpoint/model_a_weights.pth'))
 
-
+	_batch_gather(torch.tensor([[1,2,3],[2,3,4]]),torch.tensor([0,1]))
 	def _batch_gather(data: torch.Tensor, index: torch.Tensor):
 		"""
 		实现类似 tf.batch_gather 的效果
@@ -444,3 +478,9 @@ if __name__ == '__main__':
 		"""
 		index = index.unsqueeze(-1).repeat_interleave(data.size()[-1], dim=-1)  # (bs, n, hidden)
 		return torch.gather(data, 1, index)
+
+
+
+	for i in range(1,len(train_data_a)):
+		if train_data_a[i][0] == train_data_a[i-1][0]:
+			print(i)
